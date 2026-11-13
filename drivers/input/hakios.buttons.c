@@ -94,22 +94,60 @@ wr(vm_offset_t address, uint32_t value)
 
 /* ---- the PMIC arbiter ---------------------------------------------------------------------------- */
 
-#define ARB_CORE_PHYS           0x0c440000UL    /* "core": the version, and which peripheral each channel is */
-#define ARB_CORE_SIZE           0x1100UL
-#define ARB_CNFG_PHYS           0x0c40a000UL    /* "cnfg": which system owns each channel */
-#define ARB_CNFG_SIZE           0x1000UL
-#define ARB_OBSERVER_PHYS       0x0e600000UL    /* "obsrvr": 0x10000 per system, 0x80 per channel in it */
-#define ARB_OBSERVER_SIZE       0x10000UL       /* ours is the first */
+/*
+ * The arbiter and the keys of each phone. boot-arg buttons_board=NAME selects one; without it, redwood.
+ *
+ * metroid (Nothing Phone (3), SM8735), from its own device tree (qcom,spmi@c42d000: cnfg, core, chnls, obsrvr, intr):
+ * the arbiter is version 7 (SM8450 and later), whose tables moved (Linux drivers/spmi/spmi-pmic-arb.c, the v7
+ * offsets): the channel table at core + 0x2000 + 4n, the observer channels 0x8000 per system and 0x20 per channel.
+ * The device tree's sizes say the same: core 0x3000 = 0x2000 + 1024 channels of 4 bytes, obsrvr 0x80000 = 16
+ * systems of 0x8000 = 1024 channels of 0x20. Power and volume down: the PON of the PMK8550 (slave 0, 0x1300);
+ * volume up: GPIO6 of the PMXR2230 (slave 1, GPIOs from 0x8800: 0x8d00), active low (gpio_key vol_up).
+ */
+struct buttons_board {
+	const char *name;
+	uint64_t core_phys, core_size, cnfg_phys, cnfg_size, observer_phys, observer_size;
+	uint32_t channel_table;         /* core: where the table of channels starts */
+	uint32_t observer_system, observer_channel;     /* observer: the size of a system's part, and of a channel */
+	bool read_owner;                /* cnfg: who may write through a channel (version 5's place) */
+	uint32_t version_from, version_below;
+	const char *pon_name, *pin_name;
+};
+
+static const struct buttons_board buttons_boards[] = {
+	{
+		.name = "redwood", .core_phys = 0x0c440000UL, .core_size = 0x1100UL, .cnfg_phys = 0x0c40a000UL,
+		.cnfg_size = 0x1000UL, .observer_phys = 0x0e600000UL, .observer_size = 0x10000UL,
+		.channel_table = 0x900, .observer_system = 0x10000, .observer_channel = 0x80, .read_owner = true,
+		.version_from = 0x50000000u, .version_below = 0x70000000u,
+		.pon_name = "the PMK8350's power-on block", .pin_name = "GPIO6 of the PM7325",
+	},
+	{
+		.name = "metroid", .core_phys = 0x0c400000UL, .core_size = 0x3000UL, .cnfg_phys = 0x0c42d000UL,
+		.cnfg_size = 0x4000UL, .observer_phys = 0x0c440000UL, .observer_size = 0x8000UL,
+		.channel_table = 0x2000, .observer_system = 0x8000, .observer_channel = 0x20, .read_owner = false,
+		.version_from = 0x70000000u, .version_below = 0x80000000u,
+		.pon_name = "the PMK8550's power-on block", .pin_name = "GPIO6 of the PMXR2230",
+	},
+};
+static const struct buttons_board *bboard = &buttons_boards[0];
+
+#define ARB_CORE_PHYS           (bboard->core_phys)     /* "core": the version, and which peripheral each channel is */
+#define ARB_CORE_SIZE           (bboard->core_size)
+#define ARB_CNFG_PHYS           (bboard->cnfg_phys)     /* "cnfg": which system owns each channel */
+#define ARB_CNFG_SIZE           (bboard->cnfg_size)
+#define ARB_OBSERVER_PHYS       (bboard->observer_phys) /* "obsrvr": a part per system, a channel's registers in it */
+#define ARB_OBSERVER_SIZE       (bboard->observer_size) /* ours is the first */
 #define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" */
 
 #define ARB_VERSION             0x000
-#define ARB_VERSION_5           0x50000000u     /* what follows is version 5's; 7 moved things again */
+#define ARB_VERSION_5           0x50000000u     /* version 5's layout (redwood); 7 moved the tables (metroid) */
 #define ARB_VERSION_7           0x70000000u
 #define ARB_FEATURES            0x004           /* [10:0] the number of channels */
-#define ARB_CHANNEL(n)          (0x900 + 4 * (n))       /* core: [19:8] slave and peripheral, [24] interrupts go to the owner */
+#define ARB_CHANNEL(n)          (bboard->channel_table + 4 * (n))       /* core: [19:8] slave and peripheral, [24] interrupts */
 #define ARB_CHANNEL_INTERRUPTS  (1u << 24)
-#define ARB_OWNER(n)            (0x700 + 4 * (n))       /* cnfg: [2:0] the system that may write through channel n */
-#define ARB_MAX_CHANNELS        512
+#define ARB_OWNER(n)            (0x700 + 4 * (n))       /* cnfg (version 5): [2:0] the system that may write through channel n */
+#define ARB_MAX_CHANNELS        1024
 
 #define OBSERVER_COMMAND        0x00
 #define OBSERVER_STATUS         0x08
@@ -147,7 +185,8 @@ static struct {
 static const char *
 spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t count)
 {
-	vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
+	vm_offset_t channel = arb_observer + (vm_offset_t)bboard->observer_system * ARB_SYSTEM +
+	    (vm_offset_t)bboard->observer_channel * p->channel;
 	uint64_t start = mach_absolute_time(), now, interval, taken;
 	uint32_t status, data[2];
 	const char *problem = NULL;
@@ -202,7 +241,8 @@ find_channel(struct peripheral *p, uint32_t channels)
 		if (map == 0 || ((map >> 8) & 0xfff) != p->id) {
 			continue;
 		}
-		owner = rd(arb_cnfg + ARB_OWNER(n)) & 7;
+		/* (version 7 keeps the owners elsewhere: not read there; every system may read through any channel) */
+		owner = bboard->read_owner ? rd(arb_cnfg + ARB_OWNER(n)) & 7 : ARB_SYSTEM;
 		printf("buttons: channel %u is %s (%#x); written by system %u%s\n", n, p->name, map, owner,
 		    (map & ARB_CHANNEL_INTERRUPTS) ? ", which also gets its interrupts" : "");
 		if (!p->found || owner == ARB_SYSTEM) {
@@ -436,16 +476,17 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
 	bool pon_known, pin_known;
 
-	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
-	    ARB_OBSERVER_PHYS);
+	printf("buttons: step 1 (%s): map the PMIC arbiter (%#llx, %#llx, %#llx) and read its version\n", bboard->name,
+	    (unsigned long long)ARB_CORE_PHYS, (unsigned long long)ARB_CNFG_PHYS, (unsigned long long)ARB_OBSERVER_PHYS);
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
 	version = rd(arb_core + ARB_VERSION);
 	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
 	printf("buttons: PMIC arbiter version %#x, %u channels\n", version, channels);
-	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
-		printf("buttons: this driver knows version 5 of the arbiter only: no buttons\n");
+	if (version < bboard->version_from || version >= bboard->version_below) {
+		printf("buttons: %s's arbiter is version %#x to below %#x, not this one: no buttons\n", bboard->name,
+		    bboard->version_from, bboard->version_below);
 		goto out;
 	}
 	if (channels == 0 || channels > ARB_MAX_CHANNELS) {
@@ -581,6 +622,27 @@ hakios_buttons_init(void)
 	if (!enabled) {
 		return;
 	}
+	{
+		/* boot-arg buttons_board=NAME: whose arbiter and keys; redwood without it */
+		char name[16] = { 0 };
+
+		if (PE_parse_boot_arg_str("buttons_board", name, sizeof(name)) && name[0] != 0) {
+			const struct buttons_board *found = NULL;
+
+			for (unsigned i = 0; i < sizeof(buttons_boards) / sizeof(buttons_boards[0]); i++) {
+				if (strcmp(name, buttons_boards[i].name) == 0) {
+					found = &buttons_boards[i];
+				}
+			}
+			if (found == NULL) {
+				printf("buttons: no buttons board \"%s\"; the keys are left alone\n", name);
+				return;
+			}
+			bboard = found;
+		}
+	}
+	pon.name = bboard->pon_name;
+	pin.name = bboard->pin_name;
 	PE_parse_boot_argn("buttons_steps", &steps, sizeof(steps));
 	if (steps == 0) {
 		return;
