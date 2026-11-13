@@ -3908,12 +3908,32 @@ fb_command(char *cmd)
 			} else if (str_eq(var, "result")) {
 				fb_reply("OKAY", last_result);
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
-				/* width height bytes-per-row */
-				uint32_t mark = log_len;
-				print("%d %d %d", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, (uint64_t)SCREEN.stride);
-				log_buf[log_len] = 0;
-				fb_reply("OKAY", log_buf + mark);
-				log_len = mark;
+				/*
+				 * width height bytes-per-row, made here: not through print() into log_buf, which drops what does
+				 * not fit, so that a full loader log gave an empty answer (metroid, 13 November)
+				 */
+				char answer[48];
+				uint64_t field[3] = { SCREEN.width, SCREEN.height, SCREEN.stride };
+				uint32_t at = 0;
+
+				for (int f = 0; f < 3; f++) {
+					char digits[20];
+					int n = 0;
+					uint64_t v = field[f];
+
+					do {
+						digits[n++] = (char)('0' + v % 10);
+						v /= 10;
+					} while (v != 0 && n < (int)sizeof(digits));
+					if (f > 0) {
+						answer[at++] = ' ';
+					}
+					while (n > 0) {
+						answer[at++] = digits[--n];
+					}
+				}
+				answer[at] = 0;
+				fb_reply("OKAY", answer);
 			} else {
 				fb_reply("OKAY", "");
 			}

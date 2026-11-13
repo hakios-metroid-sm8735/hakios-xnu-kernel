@@ -254,6 +254,7 @@ TORCH	arg	torch	Haptics and torch	kl	hakios.torch.c,loader.c	a look, reading onl
 TORCH_MAX_S	arg	torch_max_s	Haptics and torch	k	hakios.torch.c	
 TORCH_SECS	arg	torch_secs	Haptics and torch	k	hakios.torch.c	
 TOUCH_BOARD	arg	touch_board	Touch and buttons	k	hakios.goodix.c	
+TOUCH_DUMP	arg	touch_dump	Touch and buttons	k	hakios.goodix.c	the first 60 changed raw reports are logged, for working out another chip's layout
 TOUCH_FLIP	arg	touch_flip	Touch and buttons	k	hakios.goodix.c	
 TOUCH_LAT	arg	touch_lat	GPU and display	ku	HakiosMetalCA.m,MiniIOMobileFramebuffer.cpp,eagl.c,hakios.goodix.c,hakios.gpu.cpp,hakios.input.c,inject.c,inject_sb.c	a line for every wait of a program's for the GPU that took a millisecond or more ("tl: f KIND US at US"), for telling apart what holds a frame up
 TOUCH_MAX_X	arg	touch_max_x	Touch and buttons	k	hakios.goodix.c	

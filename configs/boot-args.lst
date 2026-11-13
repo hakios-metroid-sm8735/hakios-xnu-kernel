@@ -281,6 +281,7 @@ torch	kl
 torch_max_s	k
 torch_secs	k
 touch_board	k
+touch_dump	k
 touch_flip	k
 touch_lat	ku
 touch_max_x	k

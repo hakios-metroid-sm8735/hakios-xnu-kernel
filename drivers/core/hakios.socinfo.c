@@ -216,6 +216,8 @@ static const struct { uint32_t id; const char *name; } known[] = {
 	{ 415, "SM8350" }, { 439, "SM8350" }, { 457, "SM8450" }, { 475, "SC7280 (SM7325, \"yupik\")" },
 	{ 487, "SC7280" }, { 497, "QCM6490" }, { 498, "QCS6490" }, { 483, "SM6350" }, { 434, "SM6350" },
 	{ 480, "SM7225" }, { 459, "SM7225" }, { 416, "SM8250" }, { 356, "SM8250" },
+	/* the Nothing Phone (3): Android's /sys/devices/soc0/soc_id, and this driver's own read of SMEM, 13 November */
+	{ 655, "SM8735 (\"tuna\")" },
 };
 
 static const char *

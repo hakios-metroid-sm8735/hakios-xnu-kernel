@@ -70,13 +70,29 @@ PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 # adb starts a server of its own the first time, and the server inherits every open descriptor: started during a run it
 # kept the run's lock (descriptor 8, below) for as long as it lived, and every later command said a run was in progress
 # (27 October). So adb never gets that descriptor.
-adb() { command adb "$@" 8>&-; }
+#
+# XL_SERIAL=<the phone's serial>: with more than one device on adb or fastboot, every command names this phone. Android
+# and its bootloader's fastboot show the phone's serial; the HakiOS loader's own fastboot shows "xnuloader" (another
+# serial: 13 November, a Nothing Phone (3) with a second phone on adb). Without XL_SERIAL, nothing is named, as before.
+[ -n "$XL_SERIAL" ] && unset ANDROID_SERIAL        # (fb_serial chooses; a fixed one would miss the loader or the bootloader)
+adb() { command adb ${XL_SERIAL:+-s "$XL_SERIAL"} "$@" 8>&-; }
+# which fastboot serial is this phone's now: the loader's while it is up, else the bootloader's
+fb_serial() {
+	[ -n "$XL_SERIAL" ] || return 0
+	if fastboot devices 2>/dev/null | grep -Eq '^xnuloader[[:space:]]'; then echo xnuloader; else echo "$XL_SERIAL"; fi
+}
 
 # one fastboot at a time (a run in one terminal, "xl screenshot" in another): each takes the lock for itself
-fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
+fb() { local s; s=$(fb_serial); flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot ${s:+-s "$s"} "$@" 2>&1; }
 # does the loader answer while its kernel runs (0.5 and later)? an older one answers only when the run is over
 live_loader() { fb getvar version | grep -Eq 'version: 0\.([5-9]|[1-9][0-9])'; }
-in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
+in_fastboot() {
+	if [ -n "$XL_SERIAL" ]; then
+		fastboot devices 2>/dev/null | grep -Eq "^(xnuloader|$XL_SERIAL)[[:space:]]+fastboot"
+	else
+		fastboot devices 2>/dev/null | grep -q fastboot
+	fi
+}
 is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
 state() {
 	if is_loader; then echo loader
@@ -109,7 +125,7 @@ recover_phone() {
 		else
 			case "$s" in
 			android) echo "xl: phone is back in Android"; return 0 ;;
-			fastboot) echo "xl: the phone stopped in its bootloader: sending it on to Android"; timeout 10 fastboot reboot >/dev/null 2>&1 ;;
+			fastboot) echo "xl: the phone stopped in its bootloader: sending it on to Android"; FB_TIMEOUT=10 fb reboot >/dev/null ;;
 			loader) echo "xl: the phone is in this loader: sending it on to Android"; fb reboot >/dev/null ;;
 			esac
 		fi

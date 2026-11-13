@@ -1428,6 +1428,9 @@ focaltech_contact_update(uint32_t id, uint32_t event, uint32_t x, uint32_t y,
 	}
 }
 
+/* boot-arg touch_dump=1: the first 60 changed raw reports are logged, for working out another chip's layout */
+static uint32_t focaltech_dump;
+
 /* Panel size in the FT3680 super-high-resolution reports (device tree x_max/y_max on redwood). */
 static uint32_t focaltech_max_x = 10800, focaltech_max_y = 24000;
 
@@ -1444,7 +1447,8 @@ focaltech_report(const uint8_t *report)
 		static uint8_t last[14];
 		static unsigned dumped;
 
-		if (dumped < 60 && memcmp(last, report, sizeof(last)) != 0) {
+		/* only with boot-arg touch_dump=1 (focaltech_dump): a chip that decodes already needs none of it */
+		if (focaltech_dump && dumped < 60 && memcmp(last, report, sizeof(last)) != 0) {
 			memcpy(last, report, sizeof(last));
 			dumped++;
 			printf("focaltech: report %02x %02x | %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x\n",
@@ -1800,7 +1804,13 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		before = looked;
 		if (tick % (60 * (1000000 / poll_us)) == 0) {
-			touch_replay("running");
+			static bool replayed;
+
+			/* once, a minute in: the bring-up is then in the log's end too (the start of it may be overwritten) */
+			if (!replayed) {
+				replayed = true;
+				touch_replay("running");
+			}
 			printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
 			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second\n",
 			    chip_name(), seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
@@ -1842,6 +1852,7 @@ hakios_goodix_init(void)
 	focaltech_max_y = board->max_y;
 	max_x = board->max_x;
 	max_y = board->max_y;
+	PE_parse_boot_argn("touch_dump", &focaltech_dump, sizeof(focaltech_dump));
 	PE_parse_boot_argn("touch_max_x", &focaltech_max_x, sizeof(focaltech_max_x));
 	PE_parse_boot_argn("touch_max_y", &focaltech_max_y, sizeof(focaltech_max_y));
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
