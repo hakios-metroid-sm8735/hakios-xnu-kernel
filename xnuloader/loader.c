@@ -1889,6 +1889,338 @@ hc_init(void)
 	return hc_list_is_uefis();
 }
 
+
+/*
+ * "oem ufsadopt" (metroid): can the controller be taken over as the firmware left it, with no reset,
+ * no PHY and no link startup? The steps of the kernel's own driver (hakios.ufshc.c), once, from here,
+ * each one logged before it is done: the firmware's list stopped, this loader's list (hc_area) put in,
+ * TEST UNIT READY in slot 0, READ(10) of LBA 1 of LUN 0 in slot 1 (the GPT header: "EFI PART"), the
+ * firmware's list put back. Read only: no command that writes is ever made. A doorbell is rung only
+ * when the controller reads back this loader's list address and runs it.
+ */
+static char answer_buf_for_adopt[64];
+static uint8_t *ufs_adopt_area;          /* HC_AREA_SIZE bytes below 4 GB (the list), then 4 KB of data */
+static uint8_t *ufs_adopt_data;
+
+static int
+ufs_adopt_wait(uint32_t bit, uint64_t ms)
+{
+	uint64_t t;
+
+	for (t = READ_SYSREG(CNTVCT_EL0); (hc_rd(HC_UTRLDBR) & bit) && hc_ms_since(t) < ms;) {
+	}
+	return (hc_rd(HC_UTRLDBR) & bit) == 0;
+}
+
+static void
+ufs_adopt_slot(uint32_t n, const uint8_t upiu[32], uint32_t dw0, uint64_t data, uint32_t bytes)
+{
+	volatile uint32_t *utrd = (volatile uint32_t *)(uintptr_t)(ufs_adopt_area + 32 * n);
+	uint8_t *ucd = ufs_adopt_area + HC_UCD_OFFSET + HC_UCD_SIZE * n;
+	uint64_t ucd_pa = (uint64_t)(uintptr_t)ucd;
+
+	memset(ucd, 0, HC_UCD_SIZE);
+	memcpy(ucd, upiu, 32);
+	if (bytes != 0) {
+		volatile uint32_t *prd = (volatile uint32_t *)(uintptr_t)(ucd + 1024);
+
+		prd[0] = (uint32_t)data;
+		prd[1] = (uint32_t)(data >> 32);
+		prd[2] = 0;
+		prd[3] = bytes - 1;
+	}
+	utrd[0] = dw0;
+	utrd[1] = 0;
+	utrd[2] = 0xf;                          /* OCS: invalid, until the controller writes it */
+	utrd[3] = 0;
+	utrd[4] = (uint32_t)ucd_pa;
+	utrd[5] = (uint32_t)(ucd_pa >> 32);
+	utrd[6] = ((512 / 4) << 16) | (512 / 4);
+	utrd[7] = ((1024 / 4) << 16) | (bytes != 0 ? 1 : 0);
+	flush_dcache((uint64_t)(uintptr_t)ufs_adopt_area, (uint64_t)(uintptr_t)ufs_adopt_area + HC_AREA_SIZE);
+}
+
+static uint32_t
+ufs_adopt_result(uint32_t n, const char *what)
+{
+	volatile uint32_t *utrd = (volatile uint32_t *)(uintptr_t)(ufs_adopt_area + 32 * n);
+	const uint8_t *r = ufs_adopt_area + HC_UCD_OFFSET + HC_UCD_SIZE * n + 512;
+
+	flush_dcache((uint64_t)(uintptr_t)ufs_adopt_area, (uint64_t)(uintptr_t)ufs_adopt_area + HC_AREA_SIZE);
+	print("ufs adopt: %s: OCS %x, response UPIU %x tag %x response %x status %x, sense key %x asc %x ascq %x\n", what,
+	    (uint64_t)(utrd[2] & 0xff), (uint64_t)r[0], (uint64_t)r[3], (uint64_t)r[6], (uint64_t)r[7],
+	    (uint64_t)(r[34 + 2] & 0xf), (uint64_t)r[34 + 12], (uint64_t)r[34 + 13]);
+	flush_log();
+	return (utrd[2] & 0xff) | (uint32_t)r[7] << 8;
+}
+
+/* UniPro attribute read (DME_GET): read only; IS.UCCS (bit 10) cleared before, waited for 100 ms */
+static int
+ufs_adopt_dme_get(uint32_t attr, uint32_t *value)
+{
+	uint64_t t;
+
+	if ((hc_rd(HC_HCS) & 8) == 0) {
+		return -1;
+	}
+	hc_wr(HC_IS, 1u << 10);
+	hc_wr(0x94, attr << 16);
+	hc_wr(0x98, 0);
+	hc_wr(0x9c, 0);
+	hc_wr(0x90, 0x01);
+	for (t = READ_SYSREG(CNTVCT_EL0); (hc_rd(HC_IS) & (1u << 10)) == 0 && hc_ms_since(t) < 100;) {
+	}
+	if ((hc_rd(HC_IS) & (1u << 10)) == 0) {
+		return -2;
+	}
+	hc_wr(HC_IS, 1u << 10);
+	*value = hc_rd(0x9c);
+	return (int)(hc_rd(0x98) & 0xff);
+}
+
+/* a UIC command with no attribute (DME_HIBERNATE_EXIT 0x18): IS.UCCS and the status bits it gives, 500 ms */
+static void
+ufs_adopt_uic(uint32_t command, const char *what)
+{
+	uint64_t t;
+
+	hc_wr(HC_IS, (1u << 10) | (1u << 8) | (1u << 7) | (1u << 4));
+	hc_wr(0x94, 0);
+	hc_wr(0x98, 0);
+	hc_wr(0x9c, 0);
+	hc_wr(0x90, command);
+	for (t = READ_SYSREG(CNTVCT_EL0); (hc_rd(HC_IS) & (1u << 10)) == 0 && hc_ms_since(t) < 500;) {
+	}
+	for (t = READ_SYSREG(CNTVCT_EL0); hc_ms_since(t) < 20;) {
+	}
+	print("ufs adopt: %s: IS %x (UCCS %d, hibern8 exit status %d, enter %d), result %x, HCS %x\n", what,
+	    (uint64_t)hc_rd(HC_IS), (uint64_t)((hc_rd(HC_IS) >> 10) & 1), (uint64_t)((hc_rd(HC_IS) >> 8) & 1),
+	    (uint64_t)((hc_rd(HC_IS) >> 7) & 1), (uint64_t)(hc_rd(0x98) & 0xff), (uint64_t)hc_rd(HC_HCS));
+	hc_wr(HC_IS, (1u << 10) | (1u << 8) | (1u << 7));
+	flush_log();
+}
+
+static void
+ufs_adopt_test(char *answer, int near, int wake)
+{
+	{
+		/* the firmware's slot 0: its descriptor and where its command descriptor is */
+		volatile uint32_t *abl = (volatile uint32_t *)(uintptr_t)(((uint64_t)hc_rd(HC_UTRLBAU) << 32) | hc_rd(HC_UTRLBA));
+		uint64_t abl_ucd = ((uint64_t)abl[5] << 32) | abl[4];
+
+		print("ufs adopt: 0. firmware slot 0 at %x: %x %x %x %x %x %x %x %x\n", (uint64_t)(uintptr_t)abl,
+		    (uint64_t)abl[0], (uint64_t)abl[1], (uint64_t)abl[2], (uint64_t)abl[3], (uint64_t)abl[4], (uint64_t)abl[5],
+		    (uint64_t)abl[6], (uint64_t)abl[7]);
+		if (abl_ucd != 0 && abl_ucd < 0x100000000ULL) {
+			volatile uint8_t *u = (volatile uint8_t *)(uintptr_t)abl_ucd;
+
+			print("ufs adopt: firmware slot 0 command: UPIU %x %x %x %x, CDB %x\n", (uint64_t)u[0], (uint64_t)u[1],
+			    (uint64_t)u[2], (uint64_t)u[3], (uint64_t)u[16]);
+		}
+		static const uint32_t attrs[] = { 0x1571 /* PA_PWRMODE */, 0x1560 /* PA_ACTIVETXDATALANES */,
+		    0x1568 /* PA_TXGEAR */, 0x1583 /* PA_RXGEAR */, 0x15c0 /* PA_PWRMODEUSERDATA0 */,
+		    0xd041 /* DME_VS_CORE_CLK_CTRL (Qualcomm) */ };
+		for (uint32_t i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
+			uint32_t v = 0;
+			int e = ufs_adopt_dme_get(attrs[i], &v);
+
+			print("ufs adopt: DME_GET %x: result %x, value %x\n", (uint64_t)attrs[i], (uint64_t)(int64_t)e,
+			    (uint64_t)v);
+			flush_log();
+			if (e < 0) {
+				break;
+			}
+		}
+		print("ufs adopt: HCS %x IS %x after the DME_GETs\n", (uint64_t)hc_rd(HC_HCS), (uint64_t)hc_rd(HC_IS));
+		if (ufs_adopt_area != NULL && near) {
+			ufs_adopt_area = NULL;          /* (the low pages stay allocated: a test command) */
+		}
+		if (near && abl_ucd != 0) {
+			/* free pages next to the firmware's own command descriptor: 64 KB on, then on in 64 KB steps */
+			for (uint64_t at = (abl_ucd & ~0xFFFFULL) + 0x10000; at < (abl_ucd & ~0xFFFFULL) + 0x400000; at += 0x10000) {
+				uint64_t want = at;
+
+				if (!EFI_ERROR(BS->allocate_pages(2 /* AllocateAddress */, 2 /* EfiLoaderData */,
+				    (HC_AREA_SIZE + 4096 + 0xFFF) >> 12, &want))) {
+					ufs_adopt_area = (uint8_t *)(uintptr_t)want;
+					ufs_adopt_data = ufs_adopt_area + HC_AREA_SIZE;
+					break;
+				}
+			}
+			print("ufs adopt: area next to the firmware's: %x\n", (uint64_t)(uintptr_t)ufs_adopt_area);
+		}
+	}
+	flush_log();
+	if (ufs_adopt_area == NULL) {
+		uint64_t at = 0xFFFFFFFFULL;
+
+		if (EFI_ERROR(BS->allocate_pages(1 /* AllocateMaxAddress */, 2 /* EfiLoaderData */,
+		    (HC_AREA_SIZE + 4096 + 0xFFF) >> 12, &at))) {
+			print("ufs adopt: no memory below 4 GB\n");
+			answer[0] = 'n', answer[1] = 'o', answer[2] = ' ', answer[3] = 'm', answer[4] = 'e', answer[5] = 'm', answer[6] = 0;
+			return;
+		}
+		ufs_adopt_area = (uint8_t *)(uintptr_t)at;
+		ufs_adopt_data = ufs_adopt_area + HC_AREA_SIZE;
+	}
+	uint32_t lo = hc_rd(HC_UTRLBA), hi = hc_rd(HC_UTRLBAU), area = (uint32_t)(uintptr_t)ufs_adopt_area;
+	uint32_t area_hi = (uint32_t)((uint64_t)(uintptr_t)ufs_adopt_area >> 32);
+	uint32_t tur = 0xff, rd = 0xff, cnr_in, ok_list = 0;
+	uint8_t upiu[32];
+	const char *verdict = "not tried";
+
+	print("ufs adopt: 1. state\n");
+	hc_print_state("before the takeover");
+	print("ufs adopt: HCE %x, IS %x, this loader's area %x:%x\n", (uint64_t)hc_rd(HC_HCE), (uint64_t)hc_rd(HC_IS),
+	    (uint64_t)area_hi, (uint64_t)area);
+	flush_log();
+	if ((hc_rd(HC_HCE) & 1) == 0 || (hc_rd(HC_HCS) & 3) != 3 || (hc_rd(HC_UTRLRSR) & 1) == 0 ||
+	    hc_rd(HC_UTRLDBR) != 0) {
+		verdict = "controller not ready or busy";
+		goto out;
+	}
+	cnr_in = hc_rd(HC_UTRLCNR);
+
+	print("ufs adopt: 2. this loader's list made: slot 0 TEST UNIT READY, slot 1 READ(10) LBA 1 of LUN 0\n");
+	flush_log();
+	memset(ufs_adopt_area, 0, HC_AREA_SIZE);
+	memset(upiu, 0, sizeof(upiu));
+	upiu[0] = 0x01;                         /* command UPIU, LUN 0, tag 0, TEST UNIT READY */
+	ufs_adopt_slot(0, upiu, 1u << 28, 0, 0);
+	memset(ufs_adopt_data, 0xa5, 4096);
+	flush_dcache((uint64_t)(uintptr_t)ufs_adopt_data, (uint64_t)(uintptr_t)ufs_adopt_data + 4096);
+	memset(upiu, 0, sizeof(upiu));
+	upiu[0] = 0x01;
+	upiu[1] = 0x40;                         /* read, simple */
+	upiu[3] = 1;                            /* tag 1 */
+	upiu[14] = 0x10;                        /* 4096 bytes expected */
+	upiu[16] = 0x28;                        /* READ(10), LBA 1, one block */
+	upiu[21] = 1;
+	upiu[24] = 1;
+	ufs_adopt_slot(1, upiu, (1u << 28) | (2u << 25), (uint64_t)(uintptr_t)ufs_adopt_data, 4096);
+
+	print("ufs adopt: 3. the firmware's list %x:%x stopped\n", (uint64_t)hi, (uint64_t)lo);
+	flush_log();
+	hc_wr(HC_UTRLRSR, 0);
+	for (uint64_t t = READ_SYSREG(CNTVCT_EL0); (hc_rd(HC_UTRLRSR) & 1) && hc_ms_since(t) < 100;) {
+	}
+	print("ufs adopt: run now %x; 4. this loader's list put in\n", (uint64_t)hc_rd(HC_UTRLRSR));
+	flush_log();
+	if (hc_rd(HC_UTRLRSR) & 1) {
+		verdict = "list did not stop";
+		goto out;
+	}
+	hc_wr(HC_UTRLBA, area);
+	hc_wr(HC_UTRLBAU, area_hi);
+	hc_wr(HC_UTRLRSR, 1);
+	ok_list = hc_rd(HC_UTRLBA) == area && hc_rd(HC_UTRLBAU) == area_hi && (hc_rd(HC_UTRLRSR) & 1);
+	hc_print_state("this loader's list in");
+	flush_log();
+	if (!ok_list) {
+		verdict = "controller did not take the list";
+		goto back;
+	}
+
+	if (wake) {
+		print("ufs adopt: 4b. the link out of hibernate (DME_HIBERNATE_EXIT)\n");
+		flush_log();
+		ufs_adopt_uic(0x18, "DME_HIBERNATE_EXIT");
+	}
+	print("ufs adopt: 5. slot 0 rung (TEST UNIT READY)\n");
+	flush_log();
+	hc_wr(HC_UTRLDBR, 1);
+	if (!ufs_adopt_wait(1, 1000)) {
+		print("ufs adopt: slot 0 not done in 1 s\n");
+		hc_print_state("slot 0 hung");
+		verdict = "TUR timed out";
+		goto back;
+	}
+	tur = ufs_adopt_result(0, "TEST UNIT READY");
+	if ((tur & 0xff) != 0) {
+		verdict = "TUR failed";
+		goto back;
+	}
+	if (wake && (tur >> 8) != 0) {
+		/* START STOP UNIT, power condition Active, to the UFS device well-known unit (0xd0): what Linux sends */
+		memset(upiu, 0, sizeof(upiu));
+		upiu[0] = 0x01;
+		upiu[2] = 0xd0;
+		upiu[3] = 2;
+		upiu[16] = 0x1b;
+		upiu[20] = 0x10;                /* power condition 1 (active), START 0 */
+		ufs_adopt_slot(2, upiu, 1u << 28, 0, 0);
+		print("ufs adopt: 5b. slot 2 rung (START STOP UNIT: active)\n");
+		flush_log();
+		hc_wr(HC_UTRLDBR, 4);
+		if (!ufs_adopt_wait(4, 2000)) {
+			verdict = "SSU timed out";
+			goto back;
+		}
+		(void)ufs_adopt_result(2, "START STOP UNIT");
+		upiu[2] = 0;
+		memset(upiu, 0, sizeof(upiu));
+		upiu[0] = 0x01;
+		upiu[3] = 3;
+		ufs_adopt_slot(3, upiu, 1u << 28, 0, 0);
+		hc_wr(HC_UTRLDBR, 8);
+		if (ufs_adopt_wait(8, 1000)) {
+			(void)ufs_adopt_result(3, "TEST UNIT READY again");
+		}
+	}
+
+	print("ufs adopt: 6. slot 1 rung (READ(10) LBA 1)\n");
+	flush_log();
+	hc_wr(HC_UTRLDBR, 2);
+	if (!ufs_adopt_wait(2, 1000)) {
+		print("ufs adopt: slot 1 not done in 1 s\n");
+		hc_print_state("slot 1 hung");
+		verdict = "read timed out";
+		goto back;
+	}
+	rd = ufs_adopt_result(1, "READ(10)");
+	flush_dcache((uint64_t)(uintptr_t)ufs_adopt_data, (uint64_t)(uintptr_t)ufs_adopt_data + 4096);
+	print("ufs adopt: LBA 1:");
+	for (int i = 0; i < 32; i++) {
+		print(" %s%x", ufs_adopt_data[i] < 16 ? "0" : "", (uint64_t)ufs_adopt_data[i]);
+	}
+	print("\n");
+	verdict = rd == 0 && memcmp(ufs_adopt_data, "EFI PART", 8) == 0 ? "ADOPTED: GPT read" :
+	    rd == 0 ? "read ok, no GPT at LBA 1" : "read failed";
+
+back:
+	print("ufs adopt: 7. the firmware's list put back\n");
+	flush_log();
+	if (hc_rd(HC_UTRLDBR) != 0 && hc_rd(HC_UTRLBA) == area) {
+		hc_wr(HC_UTRLCLR, 0);
+		ufs_adopt_wait(0xffffffff, 1000);
+	}
+	{
+		uint32_t ours = hc_rd(HC_UTRLCNR) & ~cnr_in;
+
+		if (ours != 0) {
+			hc_wr(HC_UTRLCNR, ours);
+		}
+	}
+	hc_wr(HC_UTRLRSR, 0);
+	for (uint64_t t = READ_SYSREG(CNTVCT_EL0); (hc_rd(HC_UTRLRSR) & 1) && hc_ms_since(t) < 100;) {
+	}
+	hc_wr(HC_UTRLBA, lo);
+	hc_wr(HC_UTRLBAU, hi);
+	hc_wr(HC_UTRLRSR, 1);
+	hc_print_state("after the takeover");
+out:
+	print("ufs adopt: %s (TUR %x, read %x)\n", verdict, (uint64_t)tur, (uint64_t)rd);
+	flush_log();
+	{
+		uint32_t at = 0;
+
+		for (const char *p = verdict; *p && at < 63; p++) {
+			answer[at++] = *p;
+		}
+		answer[at] = 0;
+	}
+}
+
 /*
  * The firmware's configuration tables, by GUID (an ACPI or device tree table among them would say
  * where the storage controller is).
@@ -3888,6 +4220,7 @@ fb_command(char *cmd)
 
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
+		    starts_with(cmd, "oem ufsprobe") || starts_with(cmd, "oem ufsadopt") || starts_with(cmd, "oem peek") || starts_with(cmd, "oem ufssurvey") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
 		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
@@ -4086,6 +4419,85 @@ fb_command(char *cmd)
 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
 			print_memory_map();
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem ufsprobe")) {
+			/*
+			 * Read only, and only when asked: what the UFS host controller looks like as the firmware left it
+			 * (metroid: did ABL leave the link up for U-Boot, with no SM8735 UFS support of its own?). Version,
+			 * capabilities, enable, status, and the transfer list. A block whose clocks are off may fault the
+			 * bus on the first read: that is why this is a command of its own, not a step of every start.
+			 */
+			char answer[64];
+			uint32_t hce, hcs;
+			const char *p = "HCE ";
+
+			print("ufs probe: controller at %x: version %x, capabilities %x\n", HC_PA, (uint64_t)hc_rd(HC_VER),
+			    (uint64_t)hc_rd(HC_CAP));
+			hce = hc_rd(HC_HCE);
+			hcs = hc_rd(HC_HCS);
+			print("ufs probe: HCE %x (enabled: %d), HCS %x (device present %d, list ready %d, task list ready %d, "
+			    "UIC ready %d)\n", (uint64_t)hce, (uint64_t)(hce & 1), (uint64_t)hcs, (uint64_t)(hcs & 1),
+			    (uint64_t)((hcs >> 1) & 1), (uint64_t)((hcs >> 2) & 1), (uint64_t)((hcs >> 3) & 1));
+			hc_print_state("as the firmware left it");
+			/* a short answer for the host: "HCE e HCS s" in hex digits */
+			uint32_t at = 0;
+			for (; *p; p++) {
+				answer[at++] = *p;
+			}
+			for (int sh = 28; sh >= 0; sh -= 4) {
+				answer[at++] = "0123456789abcdef"[(hce >> sh) & 0xf];
+			}
+			for (p = " HCS "; *p; p++) {
+				answer[at++] = *p;
+			}
+			for (int sh = 28; sh >= 0; sh -= 4) {
+				answer[at++] = "0123456789abcdef"[(hcs >> sh) & 0xf];
+			}
+			answer[at] = 0;
+			flush_log();
+			fb_reply("OKAY", answer);
+		} else if (starts_with(cmd, "oem peek ")) {
+			/*
+			 * "oem peek ADDR [WORDS]" (hex): 32-bit reads into the log, for bring-up (the SMMU's state for a
+			 * stream, say). A register block that is off or not this exception level's may fault the bus:
+			 * only addresses known to be readable.
+			 */
+			const char *a = cmd + 9;
+			uint64_t addr = 0, words = 0;
+
+			for (; (*a >= '0' && *a <= '9') || (*a >= 'a' && *a <= 'f') || *a == 'x'; a++) {
+				if (*a != 'x') {
+					addr = addr * 16 + (uint64_t)(*a <= '9' ? *a - '0' : *a - 'a' + 10);
+				}
+			}
+			for (; *a == ' '; a++) {
+			}
+			for (; (*a >= '0' && *a <= '9') || (*a >= 'a' && *a <= 'f'); a++) {
+				words = words * 16 + (uint64_t)(*a <= '9' ? *a - '0' : *a - 'a' + 10);
+			}
+			if (words == 0) {
+				words = 1;
+			}
+			if (words > 0x400) {
+				words = 0x400;
+			}
+			addr &= ~3ULL;
+			for (uint64_t i = 0; i < words; i++) {
+				if (i % 8 == 0) {
+					print("%speek %x:", i ? "\n" : "", addr + 4 * i);
+				}
+				print(" %x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(addr + 4 * i));
+			}
+			print("\n");
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem ufssurvey")) {
+			/* read only: the storage the firmware offers (block devices, partitions) into the log */
+			ufs_survey();
+			flush_log();
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem ufsadopt")) {
+			ufs_adopt_test(answer_buf_for_adopt, cmd[12] == ' ' && starts_with(cmd + 13, "near"), cmd[12] == ' ' && starts_with(cmd + 13, "wake"));
+			flush_log();
+			fb_reply("OKAY", answer_buf_for_adopt);
 		} else if (starts_with(cmd, "oem log")) {
 			if (busy && running_live != NULL) {
 				compose_live_log(running_live, running_slide);
