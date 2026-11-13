@@ -88,6 +88,7 @@ ddr	k
 ddr_rest	k
 ddr_vote	k
 display_probe	k
+end_hold	l
 epoch	k
 fb_beam	k
 fb_beat	k
@@ -278,8 +279,11 @@ thermal_tm1	k
 torch	kl
 torch_max_s	k
 torch_secs	k
+touch_board	k
 touch_flip	k
 touch_lat	ku
+touch_max_x	k
+touch_max_y	k
 touch_poll_us	k
 touch_rate	k
 touch_spi_hz	k

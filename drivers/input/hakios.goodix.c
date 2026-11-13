@@ -32,6 +32,7 @@
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+#include <stdarg.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
@@ -47,6 +48,63 @@ extern kern_return_t thread_terminate(thread_t thread);
 extern lck_mtx_t hakios_rsc_lock;
 
 static vm_offset_t tlmm, gcc, se, rsc, cmd_db;
+
+/*
+ * What the driver says is also kept here, and said again later (touch_replay): the kernel's log is a ring, and on a
+ * phone whose loader has no log partition (metroid) Darwin's start-up overwrites the driver's first lines before the
+ * host can fetch them. The end of the log survives, so the bring-up is repeated there.
+ */
+static char touch_history[4096];
+static uint32_t touch_history_len;
+
+static void touch_say(const char *format, ...) __printflike(1, 2);
+
+static void
+touch_say(const char *format, ...)
+{
+	char line[256];
+	va_list ap;
+	int n;
+
+	va_start(ap, format);
+	n = vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	if (n < 0) {
+		return;
+	}
+	if (n >= (int)sizeof(line)) {
+		n = (int)sizeof(line) - 1;
+	}
+	(printf)("%s", line);
+	if (touch_history_len + (uint32_t)n < sizeof(touch_history)) {
+		memcpy(touch_history + touch_history_len, line, (size_t)n);
+		touch_history_len += (uint32_t)n;
+	}
+}
+
+/* every printf below goes through touch_say(); (printf) with parentheses is the kernel's own */
+#define printf(...) touch_say(__VA_ARGS__)
+
+static void
+touch_replay(const char *why)
+{
+	char line[208];
+	uint32_t at = 0;
+
+	(printf)("goodix: === %s: the touch driver's start-up, again (%u bytes) ===\n", why, touch_history_len);
+	while (at < touch_history_len) {
+		uint32_t end = at;
+
+		while (end < touch_history_len && touch_history[end] != '\n' && end - at < sizeof(line) - 2) {
+			end++;
+		}
+		memcpy(line, touch_history + at, end - at);
+		line[end - at] = 0;
+		(printf)("goodix: | %s\n", line);
+		at = end < touch_history_len ? end + 1 : end;
+	}
+	(printf)("goodix: === end ===\n");
+}
 
 static inline uint32_t
 rd(vm_offset_t address)
@@ -74,6 +132,58 @@ sleep_ms(uint32_t ms)
 
 /* ---- pins (TLMM) ------------------------------------------------------------------------------- */
 
+/*
+ * The board: what differs from phone to phone. boot-arg touch_board=NAME selects one; without it, redwood.
+ *
+ * metroid (Nothing Phone (3), SM8735), from the phone's own device tree and Android's log (2026-11-13):
+ *   FocalTech, chip ID 0x5672 (runtime ID 0x56 0x72), its firmware in the chip's own flash ("tp fw valid")
+ *   SPI: QUP1 serial engine 4 (0xa90000) on gpio16 MISO, gpio17 MOSI, gpio18 CLK, gpio19 CS; there is no clock
+ *        driver for SM8735 here, so the pins are driven by hand and the engine is not touched
+ *   interrupt gpio176, reset gpio189; no analog supply switch
+ *   supplies: "ldob22" (vdd, PMXR2230 L22, 2.7-3.55 V: 3.0 V asked) and "ldod1" (iovcc, 1.8 V), through RPMh
+ *   the pins: the TLMM's GPIO registers start at 0x0f100000, as on SM8750 (the device tree's block starts at
+ *   0x0f000000, with the GPIOs 0x100000 into it)
+ *   Android reports 0..1260 x 0..2800; the 15-bit fields read here are taken to be 10 times that, as on
+ *   redwood (touch_max_x=, touch_max_y= override it; the first raw values are logged to check)
+ */
+struct touch_board {
+	const char *name;
+	uint64_t cmd_db_phys, rsc_phys;
+	unsigned miso, mosi, clk, cs, irq, reset, avdd;         /* avdd 0: no switch for the analog supply */
+	bool straps;                    /* GPIO 68/96 say which chip (redwood); else FocalTech */
+	bool engine;                    /* the serial engine with redwood's clock registers; else the pins by hand */
+	struct { const char *name; uint32_t mv; } supply[2];   /* RPMh regulators; name NULL: none */
+	uint8_t focaltech_id_low;       /* the runtime and boot ID is 0x56 and this */
+	bool focaltech_upload;          /* the FT3680 firmware built in here may be put in the chip's RAM */
+	uint32_t max_x, max_y;          /* the chip's coordinate range */
+	uint32_t point_offset;          /* where the first 6-byte touch point starts in the report */
+	bool hires;                     /* 15-bit coordinates (FT3680) or 12-bit pixels (the standard FTS layout) */
+};
+
+static const struct touch_board touch_boards[] = {
+	{
+		.name = "redwood", .cmd_db_phys = 0x80860000UL, .rsc_phys = 0x18220000UL,
+		.miso = 52, .mosi = 53, .clk = 54, .cs = 55, .irq = 81, .reset = 105, .avdd = 107,
+		.straps = true, .engine = true, .supply = { { "ldoc2", 1800 }, { NULL, 0 } },
+		.focaltech_id_low = 0x62, .focaltech_upload = true, .max_x = 10800, .max_y = 24000,
+		.point_offset = 2, .hires = true,
+	},
+	{
+		.name = "metroid", .cmd_db_phys = 0x81c60000UL, .rsc_phys = 0x17a20000UL,
+		.miso = 16, .mosi = 17, .clk = 18, .cs = 19, .irq = 176, .reset = 189, .avdd = 0,
+		.straps = false, .engine = false, .supply = { { "ldod1", 1800 }, { "ldob22", 3000 } },
+		/*
+		 * The report, read off the phone on 13 November (a tap at the top left: 00 21 | 00 ff | 00 68 00 5f bf 08 | ...):
+		 * two more header bytes than the FT3680's, then the standard FTS point at byte 4 with 12-bit pixel
+		 * coordinates, x = (b4 & 0x0f) << 8 | b5, id = b6 >> 4, y = (b6 & 0x0f) << 8 | b7 -- the tap decodes to
+		 * (104, 95). The range is Android's for this chip: 0..1260 x 0..2800 (getevent).
+		 */
+		.focaltech_id_low = 0x72, .focaltech_upload = false, .max_x = 1260, .max_y = 2800,
+		.point_offset = 4, .hires = false,
+	},
+};
+static const struct touch_board *board = &touch_boards[0];
+
 #define TLMM_PHYS               0x0f100000UL
 #define TLMM_SIZE               0x100000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
@@ -81,21 +191,37 @@ sleep_ms(uint32_t ms)
 #define PULL_NONE               0
 #define PULL_UP                 3
 
-#define PIN_MISO                52
-#define PIN_MOSI                53
-#define PIN_CLK                 54
-#define PIN_CS                  55
-#define PIN_INT                 81      /* low = the chip has a report */
-#define PIN_RESET               105     /* low = in reset */
-#define PIN_AVDD                107     /* high = analog supply on */
-#define PIN_FOCALTECH_ID        68      /* FocalTech if this reads 0 ... */
+#define PIN_MISO                (board->miso)
+#define PIN_MOSI                (board->mosi)
+#define PIN_CLK                 (board->clk)
+#define PIN_CS                  (board->cs)
+#define PIN_INT                 (board->irq)    /* low = the chip has a report */
+#define PIN_RESET               (board->reset)  /* low = in reset */
+#define PIN_AVDD                (board->avdd)   /* high = analog supply on */
+#define PIN_FOCALTECH_ID        68      /* redwood: FocalTech if this reads 0 ... */
 #define PIN_GOODIX_ID           96      /* ... and this reads 1 (sm8350-kernel-OKX convention) */
-#define PIN_FUNCTION_SPI        1       /* "qup15" */
+#define PIN_FUNCTION_SPI        1       /* redwood: "qup15" */
+
+/*
+ * Newer TLMMs (SM8450 and later: metroid's SM8735) can give a pin to another subsystem ("eGPIO"): bit 11 says the pin
+ * can be given away, bit 12 that the application processor owns it. Linux (drivers/pinctrl/qcom/pinctrl-msm.c,
+ * msm_pinmux_set_mux) sets bit 12 on such a pin whenever it configures it, "Claim ownership of pin if egpio
+ * capable". Writing the register without it gives the pin away: on 13 November the SPI pins then did nothing,
+ * while the chip itself was alive (its interrupt line fell hundreds of times under a finger). SC7280 (redwood)
+ * has neither bit.
+ */
+#define GPIO_EGPIO_PRESENT      (1u << 11)
+#define GPIO_EGPIO_ENABLE       (1u << 12)
 
 static void
 gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
 {
-	wr(GPIO_CFG(pin), pull | function << 2 | (ma / 2 - 1) << 6 | (output ? 1u << 9 : 0));
+	uint32_t value = pull | function << 2 | (ma / 2 - 1) << 6 | (output ? 1u << 9 : 0);
+
+	if (rd(GPIO_CFG(pin)) & GPIO_EGPIO_PRESENT) {
+		value |= GPIO_EGPIO_ENABLE;
+	}
+	wr(GPIO_CFG(pin), value);
 }
 
 static void
@@ -119,23 +245,30 @@ gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
 
 /* ---- the I/O supply (RPMh) ----------------------------------------------------------------------- */
 
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS             (board->cmd_db_phys)
 #define CMD_DB_SIZE             0x20000UL
-#define RSC_PHYS                0x18220000UL    /* the application processor's "DRV 2" */
+#define RSC_PHYS                (board->rsc_phys)       /* the application processor's "DRV 2" */
 #define RSC_SIZE                0x10000UL
+/*
+ * The slot registers moved in version 3 of the RSC (Linux and U-Boot drivers/soc/qcom/rpmh-rsc.c,
+ * rpmh_rsc_reg_offset_ver_2_7 and _ver_3_0): the version is read from the RSC itself (RSC_DRV_ID, bits 23:16),
+ * not assumed. Redwood's SC7280 has version 2; metroid's is read at start-up and logged.
+ */
+#define RSC_DRV_ID              0x00
+static bool rsc_v3;
 #define TCS(reg)                (rsc + 0xd00 + (reg))           /* command slot set 0, an "active" one */
 #define TCS_IRQ_ENABLE          0x00
 #define TCS_IRQ_STATUS          0x04
 #define TCS_IRQ_CLEAR           0x08
-#define TCS_WAIT_FOR_COMPLETION 0x10
-#define TCS_CONTROL             0x14
+#define TCS_WAIT_FOR_COMPLETION (rsc_v3 ? 0x20 : 0x10)
+#define TCS_CONTROL             (rsc_v3 ? 0x24 : 0x14)
 #define TCS_CONTROL_ENABLE      (1u << 16)
 #define TCS_CONTROL_TRIGGER     (1u << 24)
-#define TCS_STATUS              0x18            /* 0 while busy */
-#define TCS_CMD_ENABLE          0x1c
-#define TCS_CMD_MSGID(n)        (0x30 + 20 * (n))
-#define TCS_CMD_ADDR(n)         (0x34 + 20 * (n))
-#define TCS_CMD_DATA(n)         (0x38 + 20 * (n))
+#define TCS_STATUS              (rsc_v3 ? 0x28 : 0x18)  /* 0 while busy */
+#define TCS_CMD_ENABLE          (rsc_v3 ? 0x2c : 0x1c)
+#define TCS_CMD_MSGID(n)        (rsc_v3 ? 0x34 + 24 * (n) : 0x30 + 20 * (n))
+#define TCS_CMD_ADDR(n)         (rsc_v3 ? 0x38 + 24 * (n) : 0x34 + 20 * (n))
+#define TCS_CMD_DATA(n)         (rsc_v3 ? 0x3c + 24 * (n) : 0x38 + 20 * (n))
 #define MSGID_WRITE_4_BYTES     0x10008
 #define MSGID_RESPONSE          0x100
 
@@ -247,25 +380,37 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-/* The chip's I/O supply: 1.8 V from LDO2 of the PM8350C ("ldoc2"). Nothing else is connected to it. */
+/* One supply of the chip, through RPMh: redwood's I/O supply is 1.8 V from LDO2 of the PM8350C ("ldoc2"). */
 static bool
-io_supply_on(void)
+supply_on(const char *name, uint32_t mv)
 {
-	uint32_t base = rpmh_address("ldoc2");
+	uint32_t base = rpmh_address(name);
 	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
-	uint32_t data[3] = { 1800, 1, VRM_MODE_LDO_HPM };
+	uint32_t data[3] = { mv, 1, VRM_MODE_LDO_HPM };
 
 	/* addresses of regulators ("VRM") have 4 in bits 19:16; anything else is not what we are looking for */
 	if (base == 0 || (base >> 16 & 0xf) != 4) {
-		printf("goodix: RPMh: no regulator \"ldoc2\" (address %#x)\n", base);
+		printf("goodix: RPMh: no regulator \"%s\" (address %#x)\n", name, base);
 		return false;
 	}
-	printf("goodix: RPMh: ldoc2 is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", base,
+	printf("goodix: RPMh: %s is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", name, base,
 	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)), rd(TCS(TCS_IRQ_ENABLE)), rd(TCS(TCS_IRQ_STATUS)));
 	if (!rpmh_write(address, data, 3)) {
 		return false;
 	}
-	printf("goodix: I/O supply on (1.8 V)\n");
+	printf("goodix: %s on (%u mV)\n", name, mv);
+	return true;
+}
+
+/* The board's supplies, in its order: the I/O supply first. */
+static bool
+io_supply_on(void)
+{
+	for (unsigned i = 0; i < sizeof(board->supply) / sizeof(board->supply[0]); i++) {
+		if (board->supply[i].name != NULL && !supply_on(board->supply[i].name, board->supply[i].mv)) {
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -566,7 +711,7 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 
 /* ---- SPI by hand, on the same pins ----------------------------------------------------------------- */
 
-static unsigned bitbang_in = PIN_MISO, bitbang_out = PIN_MOSI;
+static unsigned bitbang_in, bitbang_out;       /* set by bring_up() before bitbang_init() */
 
 static void
 bitbang_init(void)
@@ -574,7 +719,11 @@ bitbang_init(void)
 	gpio_output(PIN_CS, true, PULL_NONE, 6);
 	gpio_output(PIN_CLK, false, PULL_NONE, 6);
 	gpio_output(bitbang_out, false, PULL_NONE, 6);
-	gpio_configure(bitbang_in, 0, PULL_NONE, 2, false);
+	/*
+	 * metroid (no engine): the data input pulled up, so that a chip that drives nothing reads ff, and only a chip
+	 * that drives the line low reads 00 (with no pull, a silent chip read 00 on 13 November). Redwood: as it was.
+	 */
+	gpio_configure(bitbang_in, 0, board->engine ? PULL_NONE : PULL_UP, 2, false);
 }
 
 static bool
@@ -1068,8 +1217,8 @@ focaltech_wait_valid(uint8_t *high, uint8_t *low)
 	for (int attempt = 0; attempt < 5; attempt++) {
 		if (focaltech_read(FOCALTECH_CHIP_ID_H, high, 1) &&
 		    focaltech_read(FOCALTECH_CHIP_ID_L, low, 1) &&
-		    *high == 0x56 && *low == 0x62) {
-			printf("focaltech: FT3680 runtime ID valid after %d attempt(s)\n", attempt + 1);
+		    *high == 0x56 && *low == board->focaltech_id_low) {
+			printf("focaltech: runtime ID 56 %02x valid after %d attempt(s)\n", *low, attempt + 1);
 			return true;
 		}
 		sleep_ms(200);			/* vendor INTERVAL_READ_REG */
@@ -1093,11 +1242,12 @@ focaltech_enter_boot_rom(void)
 		gpio_set(PIN_RESET, true);
 		sleep_ms(FTS_CMD_START_DELAY + cnt * 8);
 		if (focaltech_read_boot_id(&boot_high, &boot_low) &&
-		    boot_high == 0x56 && boot_low == 0x62) {
+		    boot_high == 0x56 && boot_low == board->focaltech_id_low) {
 			printf("focaltech: in boot ROM after reset %d\n", cnt);
 			return true;
 		}
-		printf("focaltech: boot ID attempt %d: %02x %02x (not 56 62)\n", cnt, boot_high, boot_low);
+		printf("focaltech: boot ID attempt %d: %02x %02x (not 56 %02x)\n", cnt, boot_high, boot_low,
+		    board->focaltech_id_low);
 	}
 	return false;
 }
@@ -1157,6 +1307,26 @@ focaltech_probe(bool verbose)
 	if (!focaltech_enter_boot_rom()) {
 		if (verbose) {
 			printf("focaltech: chip not in boot ROM; last read runtime %02x %02x\n", high, low);
+		}
+		return false;
+	}
+
+	/*
+	 * A chip whose firmware is in its own flash (metroid) never gets the FT3680 firmware built in here: it is another
+	 * chip. From its boot ROM it is only told to start what its flash holds.
+	 */
+	if (!board->focaltech_upload) {
+		printf("focaltech: no firmware upload on %s: starting the chip's own firmware\n", board->name);
+		if (!focaltech_start_app()) {
+			printf("focaltech: start-app command failed\n");
+			return false;
+		}
+		sleep_ms(300);
+		if (focaltech_wait_valid(&high, &low)) {
+			return true;
+		}
+		if (verbose) {
+			printf("focaltech: the chip's own firmware did not come up (last runtime read %02x %02x)\n", high, low);
 		}
 		return false;
 	}
@@ -1266,22 +1436,56 @@ focaltech_report(const uint8_t *report)
 {
 	uint32_t count = report[1] & 0x0f;
 
+	{
+		/*
+		 * The report's first 14 bytes as they came, each time they change, 60 times at most: for working out another
+		 * chip's layout (metroid's FocalTech 0x5672 did not decode as the FT3680's on 13 November).
+		 */
+		static uint8_t last[14];
+		static unsigned dumped;
+
+		if (dumped < 60 && memcmp(last, report, sizeof(last)) != 0) {
+			memcpy(last, report, sizeof(last));
+			dumped++;
+			printf("focaltech: report %02x %02x | %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x\n",
+			    report[0], report[1], report[2], report[3], report[4], report[5], report[6], report[7], report[8],
+			    report[9], report[10], report[11], report[12], report[13]);
+		}
+	}
+
 	for (uint32_t i = 0; i < FOCALTECH_MAX_TOUCHES; i++) {
 		focaltech_contact[i].seen = false;
 	}
 	for (uint32_t i = 0; i < FOCALTECH_MAX_TOUCHES; i++) {
-		const uint8_t *touch = report + 2 + 6 * i;
+		const uint8_t *touch = report + board->point_offset + 6 * i;
 		uint32_t id = (touch[2] >> 4) & 0x0f;
 		uint32_t event, x, y;
 
+		if (board->point_offset + 6 * (i + 1) > FOCALTECH_TOUCH_REPORT_LEN) {
+			break;			/* (a later first point leaves room for fewer points in the same report) */
+		}
 		if (id >= FOCALTECH_MAX_TOUCHES) {
 			break;			/* no more valid slots in this report */
 		}
 		event = (touch[0] >> 6) & 0x3;
-		x = ((uint32_t)(touch[0] & 0x0f) << 11) | ((uint32_t)touch[1] << 3) |
-		    ((uint32_t)touch[4] >> 5);
-		y = ((uint32_t)(touch[2] & 0x0f) << 11) | ((uint32_t)touch[3] << 3) |
-		    (((uint32_t)touch[4] & 0x1c) >> 2);
+		if (board->hires) {
+			x = ((uint32_t)(touch[0] & 0x0f) << 11) | ((uint32_t)touch[1] << 3) |
+			    ((uint32_t)touch[4] >> 5);
+			y = ((uint32_t)(touch[2] & 0x0f) << 11) | ((uint32_t)touch[3] << 3) |
+			    (((uint32_t)touch[4] & 0x1c) >> 2);
+		} else {
+			x = ((uint32_t)(touch[0] & 0x0f) << 8) | touch[1];
+			y = ((uint32_t)(touch[2] & 0x0f) << 8) | touch[3];
+		}
+		{
+			/* the chip's own values, before any scaling: what touch_max_x and touch_max_y are checked against */
+			static unsigned raw_shown;
+
+			if (event != FOCALTECH_EVENT_UP && raw_shown++ < 8) {
+				printf("focaltech: raw finger %u at %u, %u (range %u x %u)\n", id, x, y, focaltech_max_x,
+				    focaltech_max_y);
+			}
+		}
 		focaltech_contact_update(id, event, x, y, focaltech_max_x, focaltech_max_y);
 	}
 	(void)count;
@@ -1323,6 +1527,9 @@ static enum touch_chip touch_chip;
 static enum touch_chip
 touch_chip_detect(void)
 {
+	if (!board->straps) {
+		return TOUCH_FOCALTECH;         /* a board without redwood's straps has the FocalTech its table says */
+	}
 	gpio_configure(PIN_FOCALTECH_ID, 0, PULL_NONE, 2, false);
 	gpio_configure(PIN_GOODIX_ID, 0, PULL_NONE, 2, false);
 	if (gpio_get(PIN_GOODIX_ID) && !gpio_get(PIN_FOCALTECH_ID)) {
@@ -1356,6 +1563,14 @@ chip_poll(void)
 static void
 show_state(const char *when)
 {
+	if (!board->engine) {
+		/* no GCC (its registers are redwood's) and no straps on this board: the pins alone */
+		printf("goodix: %s (%s): pins cs/clk/mosi/miso cfg %#x %#x %#x %#x io %u %u %u %u, reset %#x/%u, int %#x/%u\n",
+		    when, board->name, rd(GPIO_CFG(PIN_CS)), rd(GPIO_CFG(PIN_CLK)), rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)),
+		    gpio_get(PIN_CS), gpio_get(PIN_CLK), gpio_get(PIN_MOSI), gpio_get(PIN_MISO), rd(GPIO_CFG(PIN_RESET)),
+		    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)));
+		return;
+	}
 	printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x dfs %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
 	    " reset %#x/%u, int %#x/%u, avdd %#x/%u, straps %u %u\n", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR),
 	    rd(GCC_QUP1_S_AHB_CBCR), rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)),
@@ -1375,8 +1590,15 @@ power_on(void)
 		return false;
 	}
 	sleep_ms(3);
-	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	if (PIN_AVDD != 0) {
+		gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	}
 	sleep_ms(15);
+	if (!board->straps) {
+		/* the vendor's order: supplies, then the chip out of reset (redwood's chips are reset by their probes) */
+		gpio_set(PIN_RESET, true);
+		sleep_ms(200);
+	}
 	return true;
 }
 
@@ -1402,14 +1624,20 @@ bring_up(void)
 
 	show_state("as found");
 	touch_chip = touch_chip_detect();
-	printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
-	    gpio_get(PIN_FOCALTECH_ID), chip_name());
+	if (board->straps) {
+		printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
+		    gpio_get(PIN_FOCALTECH_ID), chip_name());
+	} else {
+		printf("goodix: board %s: %s, ID 56 %02x\n", board->name, chip_name(), board->focaltech_id_low);
+	}
 	if (!power_on()) {
 		printf("goodix: the I/O supply is not on; the chip is left alone\n");
 		return false;
 	}
 
-	if (clocks_on()) {
+	if (!board->engine) {
+		problem = "this board's serial engine is not driven here";
+	} else if (clocks_on()) {
 		printf("goodix: serial engine: firmware %#x, interface %#x, parameters %#x, source clock %u Hz (select %u)\n",
 		    rd(GENI_FW_REVISION_RO), rd(GENI_IF_DISABLE_RO), rd(SE_HW_PARAM_0), se_source_hz, se_clock_select);
 		uint32_t spi_hz = 1000000;
@@ -1490,15 +1718,48 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	idle_looks = 16000 / poll_us;   /* a report read every 16 ms even with the line high, in case it is missed */
 
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
-	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
-	se = ml_io_map(SE_PHYS, SE_SIZE);
+	if (board->engine) {
+		gcc = ml_io_map(GCC_PHYS, GCC_SIZE);    /* redwood's clock and engine registers: not mapped elsewhere */
+		se = ml_io_map(SE_PHYS, SE_SIZE);
+	}
 	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	{
+		uint32_t id = rd(rsc + RSC_DRV_ID);
+
+		rsc_v3 = (id >> 16 & 0xff) == 3;
+		printf("goodix: RSC at %#llx: version %u.%u (%s slot layout)\n", (unsigned long long)RSC_PHYS, id >> 16 & 0xff,
+		    id >> 8 & 0xff, rsc_v3 ? "version 3" : "version 2");
+	}
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
 
 	if (!bring_up()) {
 		printf("goodix: no %s touch screen\n", chip_name());
-		thread_terminate(current_thread());
-		return;
+		/*
+		 * Said again every 30 s, so that the end of the kernel's log, which the host gets, holds why. Between, the
+		 * interrupt line is watched every 5 ms: a FocalTech chip that runs its firmware pulls it low for a touch
+		 * even if no one reads it over SPI, so falls while a finger is on the screen say the chip is alive.
+		 */
+		for (;;) {
+			uint32_t falls = 0, low_looks = 0, looks = 0;
+			bool was = gpio_get(PIN_INT);
+
+			touch_replay("bring-up FAILED");
+			for (uint32_t i = 0; i < 6000; i++) {
+				bool now = gpio_get(PIN_INT);
+
+				looks++;
+				if (!now) {
+					low_looks++;
+				}
+				if (was && !now) {
+					falls++;
+				}
+				was = now;
+				sleep_us(5000);
+			}
+			(printf)("goodix: interrupt line (gpio%u) over 30 s: %u falls, low in %u of %u looks; reset cfg %#x io %u\n",
+			    PIN_INT, falls, low_looks, looks, rd(GPIO_CFG(PIN_RESET)), rd(GPIO_IO(PIN_RESET)));
+		}
 	}
 	printf("goodix: %s touch screen ready; the interrupt line is looked at every %u us\n", chip_name(), poll_us);
 	{
@@ -1539,6 +1800,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		before = looked;
 		if (tick % (60 * (1000000 / poll_us)) == 0) {
+			touch_replay("running");
 			printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
 			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second\n",
 			    chip_name(), seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
@@ -1557,6 +1819,31 @@ hakios_goodix_init(void)
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	{
+		/* boot-arg touch_board=NAME: whose pins, supplies and chip; redwood without it */
+		char name[16] = { 0 };
+
+		if (PE_parse_boot_arg_str("touch_board", name, sizeof(name)) && name[0] != 0) {
+			const struct touch_board *found = NULL;
+
+			for (unsigned i = 0; i < sizeof(touch_boards) / sizeof(touch_boards[0]); i++) {
+				if (strcmp(name, touch_boards[i].name) == 0) {
+					found = &touch_boards[i];
+				}
+			}
+			if (found == NULL) {
+				printf("goodix: no touch board \"%s\"; the touch screen is left alone\n", name);
+				return;
+			}
+			board = found;
+		}
+	}
+	focaltech_max_x = board->max_x;
+	focaltech_max_y = board->max_y;
+	max_x = board->max_x;
+	max_y = board->max_y;
+	PE_parse_boot_argn("touch_max_x", &focaltech_max_x, sizeof(focaltech_max_x));
+	PE_parse_boot_argn("touch_max_y", &focaltech_max_y, sizeof(focaltech_max_y));
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

@@ -344,6 +344,14 @@ static int hc_log_skips;                /* logs not written this run (said twice
 static void hc_print_state(const char *when);
 static void hc_take_back(const char *when);
 
+/*
+ * The last run's kernel log, while no partition holds it (bio == NULL): QEMU, or a phone whose U-Boot has no storage
+ * driver yet (metroid). Until a new kernel starts, a later flush (write_logs(NULL, 0)) keeps it staged for the host,
+ * instead of leaving only the loader's own 32 KB log.
+ */
+static const char *kept_klog;
+static uint64_t kept_klog_len;
+
 static void
 write_logs(const char *klog, uint64_t klog_len)
 {
@@ -351,8 +359,18 @@ write_logs(const char *klog, uint64_t klog_len)
 
 	compose_logs(klog, klog_len);
 	if (bio == NULL) {
-		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
 		if (klog != NULL) {
+			kept_klog = klog;
+			kept_klog_len = klog_len;
+		} else if (kept_klog != NULL) {
+			compose_logs(kept_klog, kept_klog_len);
+		}
+		/*
+		 * No log partition: echo the returned kernel log on the console instead (QEMU). Not with a host on USB
+		 * (screen_quiet): the host fetches the staged copy, and the echo would fill the loader's own 32 KB log
+		 * with the kernel's first 32 KB.
+		 */
+		if (klog != NULL && !screen_quiet) {
 			print("\n== KERNEL LOG ==\n");
 			for (uint64_t i = 0; i < klog_len; i++) {
 				put_char(klog[i]);
@@ -3474,6 +3492,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (kernel_mpidr != this_mpidr) {
 		print("the kernel will run on core %x (this is core %x)\n", kernel_mpidr, this_mpidr);
 	}
+	kept_klog = NULL;                       /* the last run's log is in memory this kernel now owns */
+	kept_klog_len = 0;
 	print("jumping to %x\n", entry_va + slide);
 	flush_log();
 	screen_quiet_before_run = screen_quiet;
@@ -4042,7 +4062,8 @@ fb_command(char *cmd)
 			if (busy && running_live != NULL) {
 				compose_live_log(running_live, running_slide);
 			} else {
-				compose_logs(NULL, 0);
+				/* after a run with no log partition, its kernel log stays in what the host fetches (write_logs) */
+				compose_logs(kept_klog, kept_klog_len);
 			}
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
