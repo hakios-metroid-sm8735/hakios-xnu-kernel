@@ -23,6 +23,10 @@
  *
  * Registers come from the device tree node /arm-io/gic:
  *   reg = <distributor offset, size, redistributor offset, size>
+ *   redistributor-stride = <bytes>  (optional, 64-bit): the distance between two processors' frames, as
+ *       Linux's binding has it. Without it, GICR_FRAME_SIZE. A redistributor with the virtual-LPI pages has
+ *       frames twice as big: SM8735 (metroid) is one, 0x40000 apart ("redistributor-stride" in its own
+ *       device tree; Android finds CPU0's at 0x17180000 and CPU1's at 0x171c0000).
  */
 #include <mach/mach_types.h>
 #include <kern/debug.h>
@@ -80,6 +84,7 @@
 
 static vm_offset_t gicd_base, gicr_base;
 static vm_size_t   gicr_size;
+static vm_size_t   gicr_stride = GICR_FRAME_SIZE;      /* the device tree's redistributor-stride, if it gives one */
 static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
 
 /*
@@ -399,7 +404,7 @@ gic_find_redistributor(void)
 	/* GICR_TYPER[63:32] packs Aff3.Aff2.Aff1.Aff0 */
 	uint32_t affinity = (uint32_t)(((mpidr >> 32) & 0xff) << 24 | (mpidr & 0xffffff));
 
-	for (vm_offset_t frame = gicr_base; frame + GICR_FRAME_SIZE <= gicr_base + gicr_size; frame += GICR_FRAME_SIZE) {
+	for (vm_offset_t frame = gicr_base; frame + GICR_FRAME_SIZE <= gicr_base + gicr_size; frame += gicr_stride) {
 		uint64_t typer = *(volatile uint64_t *)(frame + GICR_TYPER);
 
 		if ((uint32_t)(typer >> 32) == affinity) {
@@ -437,6 +442,18 @@ gic_v3_irq_cpu_init(void)
 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
 		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
 		gicr_size = reg[3];
+		if (SecureDTGetProperty(entry, "redistributor-stride", &prop, &prop_size) == kSuccess &&
+		    prop_size == sizeof(uint64_t)) {
+			uint64_t stride = *(uint64_t const *)prop;
+
+			/* a whole number of 64 KB pages, at least the two of a GICv3 frame, at most four frames' worth */
+			if (stride % 0x10000 == 0 && stride >= GICR_FRAME_SIZE && stride <= 4 * GICR_FRAME_SIZE) {
+				gicr_stride = (vm_size_t)stride;
+			} else {
+				kprintf("gic: redistributor-stride %#llx not used: not a multiple of 64 KB from %#x to %#x\n",
+				    stride, GICR_FRAME_SIZE, 4 * GICR_FRAME_SIZE);
+			}
+		}
 		if (gicd_base == 0 || gicr_base == 0) {
 			panic("gic: cannot map the distributor/redistributor");
 		}

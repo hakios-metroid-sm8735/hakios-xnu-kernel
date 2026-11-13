@@ -572,6 +572,8 @@ struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
+	uint64_t gic_redist_size;        /* all processors' redistributor frames; 0: 0x100000 (8 frames of 0x20000) */
+	uint64_t gic_redist_stride;      /* the distance between two frames, given to the kernel; 0: none given */
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
@@ -613,12 +615,14 @@ static const struct platform platform_metroid = {
 	 */
 	.name = "metroid", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x17100000, .gic_redist = 0x17180000, .uart = 0,
-	.cores = 8, .core_shift = 8,
 	/*
-	 * cpu0-1: 2.0 GHz (capacity 569); cpu2-6: 2.8-3.0 GHz; cpu7: 3.2 GHz (capacity 1024).
-	 * Not yet checked on the phone: the tree gives the redistributors 0x200000 for 8 cores (0x40000 each, as GICv4),
-	 * and the GIC node below passes 0x100000. Run on cpu0 alone until the kernel is seen to find every core's frame.
+	 * The redistributors' frames are 0x40000 apart, 0x200000 for the 8 (the phone's device tree:
+	 * redistributor-stride = <0x0 0x40000>, reg ... 0x17180000 0x200000; Android finds CPU0's at 0x17180000 and
+	 * CPU1's at 0x171c0000). The kernel walks them by the stride given here.
 	 */
+	.gic_redist_size = 0x200000, .gic_redist_stride = 0x40000,
+	.cores = 8, .core_shift = 8,
+	/* cpu0-1: 2.0 GHz (capacity 569); cpu2-6: 2.8-3.0 GHz; cpu7: 3.2 GHz (capacity 1024). */
 	.small_cores = 0x03,
 };
 
@@ -3462,8 +3466,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
-	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
+	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base,
+		                plat->gic_redist_size != 0 ? plat->gic_redist_size : 0x100000 };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
+	if (plat->gic_redist_stride != 0) {
+		dt_prop_u64(&w, "redistributor-stride", plat->gic_redist_stride);       /* (gic_v3_irq.c reads it) */
+	}
 	dt_end(&w);
 	if (plat->uart != 0) {
 		dt_begin(&w, "uart0");
