@@ -588,6 +588,22 @@ static const struct platform platform_redwood = {
 	.small_cores = 0x0f,
 };
 
+static const struct platform platform_metroid = {
+	/*
+	 * Nothing Phone (3), SM8735 (Qualcomm's "Tuna"). Values from the running phone's own tree and /sys
+	 * (devices/metroid/README.md). The SoC's peripherals, the GIC included, lie in the same window as redwood's.
+	 */
+	.name = "metroid", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17100000, .gic_redist = 0x17180000, .uart = 0,
+	.cores = 8, .core_shift = 8,
+	/*
+	 * cpu0-1: 2.0 GHz (capacity 569); cpu2-6: 2.8-3.0 GHz; cpu7: 3.2 GHz (capacity 1024).
+	 * Not yet checked on the phone: the tree gives the redistributors 0x200000 for 8 cores (0x40000 each, as GICv4),
+	 * and the GIC node below passes 0x100000. Run on cpu0 alone until the kernel is seen to find every core's frame.
+	 */
+	.small_cores = 0x03,
+};
+
 /* ------------------------------------------------------------------------ */
 
 static void
@@ -3799,6 +3815,40 @@ starts_with(const char *s, const char *prefix)
 }
 
 /*
+ * end_hold=N (seconds, at most 600): in one-shot mode, keep the last screen for N seconds before the reset.
+ * On a phone with no host on USB (a new port's first boots) the screen is the only place the result is shown,
+ * and the reset that ends a one-shot run otherwise takes it away at once. Without the argument nothing changes.
+ */
+static void
+end_hold(const char *cmdline)
+{
+	uint64_t seconds = 0;
+
+	if (cmdline == NULL) {
+		return;
+	}
+	for (const char *c = cmdline; *c; c++) {
+		if (starts_with(c, "end_hold=") && (c == cmdline || c[-1] == ' ')) {
+			for (c += 9; *c >= '0' && *c <= '9'; c++) {
+				seconds = seconds * 10 + (uint64_t)(*c - '0');
+				if (seconds > 600) {
+					seconds = 600;
+				}
+			}
+			break;
+		}
+	}
+	if (seconds == 0) {
+		return;
+	}
+	print("end_hold: the reset in %d s\n", seconds);
+	flush_log();
+	for (uint64_t i = 0; i < seconds; i++) {
+		BS->stall(1000000);
+	}
+}
+
+/*
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
  */
@@ -4345,6 +4395,8 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (SCREEN.base == 0xFC800000ULL) {
+			PLAT = &platform_metroid;      /* ABL's splash region on the Nothing Phone (3) */
 		} else {
 			ramfb_phone_screen();
 		}
@@ -4364,6 +4416,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
 		run_kernel(0, 0);
+		end_hold(pi.cmdline);
 	}
 	reboot();
 	return 0;

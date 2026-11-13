@@ -105,6 +105,11 @@ def aoss_mailbox(nodes):
             address = reg_address(nodes, path)
             if address is not None:
                 return address
+    # A newer vendor tree (Tuna, SM8735) uses the plain compatible qcom,aoss-qmp, with no SoC name in it.
+    path, _ = find(nodes, 'qcom,aoss-qmp')
+    address = reg_address(nodes, path)
+    if address is not None:
+        return address
     for path, props in nodes.items():
         if path.rsplit('/', 1)[-1].split('@', 1)[0] == 'qcom,qmp-aop':
             address = reg_address(nodes, path)
@@ -152,18 +157,27 @@ def main():
         if 'phandle' in props:
             by_phandle[u32(props['phandle'])] = (path, props)
 
-    def reserved(leaf, arg):
-        path, _ = find_named(nodes, leaf)
-        address(arg, reg_address(nodes, path))
+    def reserved(leaf, arg, prefixes=('',)):
+        # a mainline-style tree names the reservation <leaf>@...; a newer vendor tree (Tuna, SM8735) names
+        # it <leaf>_region@..., sometimes with a prefix (aop_cmd_db_region). The mainline name is preferred.
+        for name in [leaf] + [p + leaf + '_region' for p in prefixes]:
+            path, _ = find_named(nodes, name)
+            value = reg_address(nodes, path)
+            if value is not None:
+                address(arg, value)
+                return
 
-    reserved('cmd_db', 'soc_cmd_db')
+    reserved('cmd_db', 'soc_cmd_db', prefixes=('', 'aop_'))
     reserved('mpss', 'soc_mpss_mem')
     reserved('ipa_gsi', 'modem_ipa_fw_at')              # where the IPA's firmware is loaded (the ipa_gsi reservation)
-    _, smem = find(nodes, 'qcom,smem')
+    smem_path, smem = find(nodes, 'qcom,smem')
     if smem and 'memory-region' in smem:
         target = by_phandle.get(u32(smem['memory-region']))
         if target:
             address('soc_smem', reg_address(nodes, target[0]))
+    elif smem and 'reg' in smem:
+        # a newer vendor tree puts compatible qcom,smem on the reserved-memory node itself
+        address('soc_smem', reg_address(nodes, smem_path))
     path, _ = find(nodes, 'qcom,msm-imem')
     imem = reg_address(nodes, path)
     if imem is not None:
